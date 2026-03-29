@@ -1,0 +1,270 @@
+name: CI Watchdog
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours
+  workflow_dispatch:          # allow manual trigger
+
+permissions:
+  contents: read
+
+jobs:
+  watchdog:
+    name: Triage failed runs
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+      - name: Triage failures and open issues
+        uses: actions/github-script@v7
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+          WATCHDOG_TOKEN: ${{ secrets.WATCHDOG_TOKEN }}
+        with:
+          # Use a PAT with repo + notifications scope so we can read
+          # notifications across all repos and write issues.
+          github-token: ${{ secrets.WATCHDOG_TOKEN }}
+          script: |
+            const token = process.env.WATCHDOG_TOKEN;
+
+            // ── Failure classifiers ──────────────────────────────────────────
+            // Each returns a string label or null if it doesn't match.
+            const CLASSIFIERS = [
+              {
+                label: 'expired-secret',
+                pattern: /MIRROR_TOKEN|401 Unauthorized|Bad credentials|authentication.*failed/i,
+                advice: 'Rotate the `MIRROR_TOKEN` secret. Generate a new PAT at https://github.com/settings/tokens and update it with `gh secret set MIRROR_TOKEN` in each affected repo.',
+              },
+              {
+                label: 'upstream-script-bug',
+                pattern: /lqx1\.patch.*No such file|BUILDENV.*unknown option|unknown public key/i,
+                advice: 'This is a bug in the upstream `damentz/liquorix-package` 6.19 scripts. The job is already marked `continue-on-error`. No action needed — monitor https://github.com/damentz/liquorix-package for a fix.',
+              },
+              {
+                label: 'docker-permission',
+                pattern: /read-only file system|Permission denied.*liquorix-package/i,
+                advice: 'A Docker bind-mount is using `:ro` on a path that needs to be writable. Remove `:ro` from the mount in the relevant `scripts/lib/build-*.sh` file.',
+              },
+              {
+                label: 'yaml-parse-error',
+                pattern: /yaml.*parse|invalid workflow|workflow.*syntax/i,
+                advice: 'A workflow file has a YAML syntax error. Validate with `python3 -c "import yaml; yaml.safe_load(open(\'.github/workflows/FILE.yml\'))"` and fix the indentation.',
+              },
+              {
+                label: 'docker-image-not-found',
+                pattern: /exit code 125|Unable to find image|image.*not found|No such image/i,
+                advice: 'A Docker image referenced in the workflow does not exist locally. Ensure the Bootstrap step runs before any `docker run` step, and that `--load` is passed to `docker buildx build`.',
+              },
+              {
+                label: 'kernel-source-missing',
+                pattern: /cannot stat.*orig\.tar\.xz|linux-liquorix.*No such file/i,
+                advice: 'The kernel source tarball was not downloaded before the build step. Ensure the "Download kernel source" step runs `common_bootstrap.sh` before `make build-*`.',
+              },
+              {
+                label: 'sc2010-shellcheck',
+                pattern: /SC2010|ls.*grep/i,
+                advice: 'shellcheck SC2010: replace `ls | grep` with `find -name` to avoid false matches on filenames with special characters.',
+              },
+            ];
+
+            function classify(logText) {
+              for (const c of CLASSIFIERS) {
+                if (c.pattern.test(logText)) return c;
+              }
+              return null;
+            }
+
+            // ── Helpers ──────────────────────────────────────────────────────
+
+            async function getJson(url) {
+              const res = await fetch(url, {
+                headers: {
+                  Authorization: `token ${token}`,
+                  Accept: 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                },
+              });
+              if (!res.ok) throw new Error(`GET ${url} → ${res.status}`);
+              return res.json();
+            }
+
+            async function patchJson(url, body) {
+              const res = await fetch(url, {
+                method: 'PATCH',
+                headers: {
+                  Authorization: `token ${token}`,
+                  Accept: 'application/vnd.github+json',
+                  'Content-Type': 'application/json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                },
+                body: JSON.stringify(body),
+              });
+              return res.ok;
+            }
+
+            async function getLogText(logsUrl) {
+              const res = await fetch(logsUrl, {
+                headers: { Authorization: `token ${token}` },
+                redirect: 'follow',
+              });
+              if (!res.ok) return '';
+              const buf = await res.arrayBuffer();
+              // Logs may be a zip — just decode as text and search for patterns
+              return Buffer.from(buf).toString('utf8', 0, Math.min(buf.byteLength, 200000));
+            }
+
+            async function issueExists(owner, repo, title) {
+              const issues = await getJson(
+                `https://api.github.com/repos/${owner}/${repo}/issues?state=open&labels=ci-watchdog&per_page=50`
+              );
+              return issues.some(i => i.title === title);
+            }
+
+            async function openIssue(owner, repo, title, body) {
+              // Ensure label exists
+              try {
+                await fetch(`https://api.github.com/repos/${owner}/${repo}/labels`, {
+                  method: 'POST',
+                  headers: {
+                    Authorization: `token ${token}`,
+                    Accept: 'application/vnd.github+json',
+                    'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify({ name: 'ci-watchdog', color: 'e4e669', description: 'Opened by CI watchdog' }),
+                });
+              } catch (_) {}
+
+              await fetch(`https://api.github.com/repos/${owner}/${repo}/issues`, {
+                method: 'POST',
+                headers: {
+                  Authorization: `token ${token}`,
+                  Accept: 'application/vnd.github+json',
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ title, body, labels: ['ci-watchdog'] }),
+              });
+            }
+
+            // ── Main ─────────────────────────────────────────────────────────
+
+            core.info('Fetching unread notifications...');
+            const notifications = await getJson(
+              'https://api.github.com/notifications?all=false&per_page=50'
+            );
+
+            const failureNotifs = notifications.filter(n =>
+              n.subject.type === 'CheckSuite' || n.subject.type === 'WorkflowRun'
+            );
+
+            core.info(`Found ${notifications.length} unread notifications, ${failureNotifs.length} workflow-related`);
+
+            const processed = [];
+
+            for (const notif of notifications) {
+              const repoFullName = notif.repository.full_name;
+              const [owner, repo] = repoFullName.split('/');
+
+              // Only process workflow run notifications
+              if (notif.subject.type !== 'CheckSuite' && notif.subject.type !== 'WorkflowRun') {
+                // Mark non-workflow notifications read and skip
+                await patchJson(`https://api.github.com/notifications/threads/${notif.id}`, { read: true });
+                continue;
+              }
+
+              core.info(`Processing: ${repoFullName} — ${notif.subject.title}`);
+
+              // Get the latest failed run for this repo
+              let runs;
+              try {
+                runs = await getJson(
+                  `https://api.github.com/repos/${repoFullName}/actions/runs?status=failure&per_page=5`
+                );
+              } catch (e) {
+                core.warning(`Could not fetch runs for ${repoFullName}: ${e.message}`);
+                continue;
+              }
+
+              if (!runs.workflow_runs?.length) {
+                await patchJson(`https://api.github.com/notifications/threads/${notif.id}`, { read: true });
+                continue;
+              }
+
+              const run = runs.workflow_runs[0];
+
+              // Skip if conclusion is not failure (may be success now)
+              if (run.conclusion !== 'failure') {
+                await patchJson(`https://api.github.com/notifications/threads/${notif.id}`, { read: true });
+                continue;
+              }
+
+              // Get failed jobs
+              let jobs;
+              try {
+                jobs = await getJson(
+                  `https://api.github.com/repos/${repoFullName}/actions/runs/${run.id}/jobs`
+                );
+              } catch (e) {
+                core.warning(`Could not fetch jobs for run ${run.id}: ${e.message}`);
+                continue;
+              }
+
+              const failedJobs = (jobs.jobs || []).filter(
+                j => j.conclusion === 'failure'
+              );
+
+              if (!failedJobs.length) {
+                await patchJson(`https://api.github.com/notifications/threads/${notif.id}`, { read: true });
+                continue;
+              }
+
+              // Fetch logs for the first failed job and classify
+              const failedJob = failedJobs[0];
+              let logText = '';
+              try {
+                logText = await getLogText(
+                  `https://api.github.com/repos/${repoFullName}/actions/jobs/${failedJob.id}/logs`
+                );
+              } catch (e) {
+                core.warning(`Could not fetch logs for job ${failedJob.id}: ${e.message}`);
+              }
+
+              const classifier = classify(logText);
+              const runUrl = run.html_url;
+              const jobName = failedJob.name;
+              const workflowName = run.name;
+
+              const issueTitle = classifier
+                ? `[ci-watchdog] ${repoFullName}: ${workflowName} / ${jobName} — ${classifier.label}`
+                : `[ci-watchdog] ${repoFullName}: ${workflowName} / ${jobName} — unknown failure`;
+
+              // Don't open duplicate issues
+              const exists = await issueExists(owner, repo, issueTitle);
+              if (!exists) {
+                const logSnippet = logText
+                  .split('\n')
+                  .filter(l => /error|Error|ERROR|failed|Failed|FAILED/i.test(l))
+                  .slice(-20)
+                  .join('\n');
+
+                const body = classifier
+                  ? `## CI Watchdog — ${classifier.label}\n\n**Run:** ${runUrl}\n**Job:** \`${jobName}\`\n\n### Diagnosis\n${classifier.advice}\n\n### Log excerpt\n\`\`\`\n${logSnippet.slice(0, 3000)}\n\`\`\``
+                  : `## CI Watchdog — unclassified failure\n\n**Run:** ${runUrl}\n**Job:** \`${jobName}\`\n\nThis failure was not matched by any known pattern. Manual investigation required.\n\n### Log excerpt\n\`\`\`\n${logSnippet.slice(0, 3000)}\n\`\`\``;
+
+                core.info(`Opening issue: ${issueTitle}`);
+                await openIssue(owner, repo, issueTitle, body);
+                processed.push(issueTitle);
+              } else {
+                core.info(`Issue already exists, skipping: ${issueTitle}`);
+              }
+
+              // Mark notification read
+              await patchJson(`https://api.github.com/notifications/threads/${notif.id}`, { read: true });
+            }
+
+            core.info(`Done. Processed ${processed.length} new issues.`);
+            if (processed.length) {
+              core.info('Opened issues:\n' + processed.map(t => `  - ${t}`).join('\n'));
+            }
