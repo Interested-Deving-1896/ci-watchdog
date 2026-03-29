@@ -1,0 +1,39 @@
+name: Stale issues
+
+on:
+  schedule:
+    - cron: "0 8 * * *"   # daily at 08:00 UTC
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  stale:
+    name: Close resolved watchdog issues
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          # Only manage issues opened by the watchdog
+          only-labels: ci-watchdog
+
+          # Mark stale after 7 days of no activity
+          days-before-stale: 7
+          stale-issue-label: stale
+          stale-issue-message: >
+            This issue has had no activity for 7 days. If the underlying CI
+            failure has been resolved, this issue will be closed in 3 days.
+            Re-open or comment if the problem persists.
+
+          # Close 3 days after being marked stale
+          days-before-close: 3
+          close-issue-message: >
+            Closing as resolved or no longer active. Re-open if the failure
+            recurs.
+
+          # Never touch PRs
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
