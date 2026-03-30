@@ -14,6 +14,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # ratchet:actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: Interested-Deving-1896
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # ratchet:actions/checkout@v4
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -22,11 +30,10 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # ratchet:actions/github-script@v7
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-          WATCHDOG_TOKEN: ${{ secrets.WATCHDOG_TOKEN }}
+          WATCHDOG_TOKEN: ${{ steps.app-token.outputs.token }}
         with:
-          # Use a PAT with repo + notifications scope so we can read
-          # notifications across all repos and write issues.
-          github-token: ${{ secrets.WATCHDOG_TOKEN }}
+          # Use a short-lived app installation token — no expiry risk.
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const token = process.env.WATCHDOG_TOKEN;
 
