@@ -30,12 +30,20 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # ratchet:actions/github-script@v7
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-          WATCHDOG_TOKEN: ${{ steps.app-token.outputs.token }}
+          # PAT with notifications scope — used to read /notifications and fetch
+          # run logs across repos. The GitHub App token lacks this permission.
+          WATCHDOG_TOKEN: ${{ secrets.WATCHDOG_TOKEN }}
+          # App installation token — used to open issues in other repos where
+          # the app is installed. Falls back to WATCHDOG_TOKEN if app is absent.
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
         with:
-          # Use a short-lived app installation token — no expiry risk.
-          github-token: ${{ steps.app-token.outputs.token }}
+          github-token: ${{ secrets.WATCHDOG_TOKEN }}
           script: |
-            const token = process.env.WATCHDOG_TOKEN;
+            // notifToken: PAT with notifications scope (reads /notifications + logs)
+            // issueToken: app installation token (opens issues cross-repo)
+            const notifToken = process.env.WATCHDOG_TOKEN;
+            const issueToken = process.env.APP_TOKEN || notifToken;
+            const token = notifToken;
 
             // ── Failure classifiers ──────────────────────────────────────────
             // Each returns a string label or null if it doesn't match.
@@ -124,9 +132,13 @@ jobs:
             }
 
             async function issueExists(owner, repo, title) {
-              const issues = await getJson(
-                `https://api.github.com/repos/${owner}/${repo}/issues?state=open&labels=ci-watchdog&per_page=50`
+              // Use issueToken — app token has issues:read across installed repos
+              const res = await fetch(
+                `https://api.github.com/repos/${owner}/${repo}/issues?state=open&labels=ci-watchdog&per_page=50`,
+                { headers: { Authorization: `token ${issueToken}`, Accept: 'application/vnd.github+json' } }
               );
+              if (!res.ok) return false;
+              const issues = await res.json();
               return issues.some(i => i.title === title);
             }
 
@@ -136,7 +148,7 @@ jobs:
                 await fetch(`https://api.github.com/repos/${owner}/${repo}/labels`, {
                   method: 'POST',
                   headers: {
-                    Authorization: `token ${token}`,
+                    Authorization: `token ${issueToken}`,
                     Accept: 'application/vnd.github+json',
                     'Content-Type': 'application/json',
                   },
@@ -147,7 +159,7 @@ jobs:
               await fetch(`https://api.github.com/repos/${owner}/${repo}/issues`, {
                 method: 'POST',
                 headers: {
-                  Authorization: `token ${token}`,
+                  Authorization: `token ${issueToken}`,
                   Accept: 'application/vnd.github+json',
                   'Content-Type': 'application/json',
                 },
@@ -275,3 +287,4 @@ jobs:
             if (processed.length) {
               core.info('Opened issues:\n' + processed.map(t => `  - ${t}`).join('\n'));
             }
+
